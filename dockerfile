@@ -26,7 +26,7 @@ RUN wget https://www.ftp.cpc.ncep.noaa.gov/wd51we/wgrib2/wgrib2.tgz && \
     cd grib2 && \
     export CC=gcc && \
     export FC=gfortran && \
-    make && \
+    make DISABLE_NETCDF=1 DISABLE_JASPER=1 DISABLE_PNG=1 DISABLE_IPOLATES=1 && \
     cp wgrib2/wgrib2 /usr/local/bin/ && \
     cd / && \
     rm -rf /tmp/grib2 /tmp/wgrib2.tgz
