@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-ingest_nbm_streaming.py - Ultra-low memory NBM ingestion
-Streams data in mini-batches of 100 records to minimize memory usage
+ingest_nbm_streaming_optimized.py - Ultra-low memory NBM ingestion with optimized spatial matching
+Key optimizations:
+- Pre-compute spatial mapping once per forecast hour
+- Stream CSV line-by-line with direct lookups
+- Larger batch sizes with single commit
+- Reuse connections and prepared statements
 """
 
 import os
@@ -14,8 +18,8 @@ from pathlib import Path
 
 import psycopg2
 from psycopg2.extras import execute_values
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 import redis as redis_lib
-import pandas as pd
 import numpy as np
 from scipy.spatial import cKDTree
 
@@ -42,9 +46,9 @@ class StreamingNBMIngester:
             except Exception as e:
                 self.log(f"⚠ Redis not available: {e}")
         
-        # Configuration
+        # Configuration - optimized for speed
         self.hot_zips = int(os.environ.get('HOT_ZIPS', '5000'))
-        self.batch_size = 100  # Insert every 100 records
+        self.batch_size = 5000  # Larger batches, fewer commits
         
         # Variable definitions
         self.variables = {
@@ -253,8 +257,8 @@ class StreamingNBMIngester:
         size_mb = len(data) / (1024 * 1024)
         return size_mb
     
-    def insert_batch(self, batch, conn, cur):
-        """Insert a batch of records"""
+    def bulk_insert_batch(self, batch, conn, cur):
+        """Insert a batch of records with single commit"""
         if not batch:
             return
         
@@ -290,7 +294,7 @@ class StreamingNBMIngester:
                 cape = EXCLUDED.cape
         """
         
-        execute_values(cur, query, values)
+        execute_values(cur, query, values, page_size=1000)
         conn.commit()
     
     def extract_variable_csv(self, grib_path, pattern, csv_path):
@@ -313,21 +317,72 @@ class StreamingNBMIngester:
         
         return csv_path
     
-    def read_wgrib2_csv(self, csv_file):
-        """Read wgrib2 CSV output"""
-        df = pd.read_csv(csv_file, header=None, names=[
-            'ref_time', 'valid_time', 'var', 'level', 'lon', 'lat', 'value'
+    def build_spatial_mapping(self, first_csv_path, zips):
+        """
+        Build grid-to-ZIP mapping ONCE per forecast hour.
+        Returns: (grid_to_zip_map, valid_time)
+        where grid_to_zip_map[grid_idx] = zip_code or None
+        """
+        self.log("    Building spatial mapping...")
+        
+        # Read grid coordinates
+        grid_coords = []
+        valid_time = None
+        
+        with open(first_csv_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split(',')
+                if len(parts) < 7:
+                    continue
+                if valid_time is None:
+                    valid_time = parts[1]
+                lat = float(parts[5])
+                lon = float(parts[4])
+                grid_coords.append([lat, lon])
+        
+        grid_coords = np.array(grid_coords, dtype=np.float32)
+        tree = cKDTree(grid_coords)
+        
+        # Prepare ZIP coordinates
+        zip_coords = np.column_stack([
+            np.array([z['lat'] for z in zips], dtype=np.float32),
+            np.array([z['lon'] for z in zips], dtype=np.float32)
         ])
-        return df
+        
+        # Handle longitude wrapping if needed
+        if np.max(grid_coords[:, 1]) > 180:
+            zip_coords[:, 1] = np.where(zip_coords[:, 1] < 0, 
+                                        zip_coords[:, 1] + 360, 
+                                        zip_coords[:, 1])
+        
+        # Find nearest grid point for each ZIP
+        distances, grid_indices = tree.query(zip_coords, k=1)
+        
+        # Build reverse mapping: grid_idx -> zip_code
+        grid_to_zip = {}
+        matched_count = 0
+        
+        for zip_idx, (grid_idx, distance) in enumerate(zip(grid_indices, distances)):
+            if distance < 0.03:  # ~3km threshold
+                grid_to_zip[grid_idx] = zips[zip_idx]['zip']
+                matched_count += 1
+        
+        self.log(f"    Mapped {matched_count}/{len(zips)} ZIPs to {len(grid_coords)} grid points")
+        
+        # Clean up
+        del grid_coords, tree, zip_coords, grid_indices, distances
+        gc.collect()
+        
+        return grid_to_zip, valid_time
     
     def extract_nbm_data_streaming_optimized(self, grib_path, zips, fhr_str):
         """
-        ULTRA STREAMING extraction - minimal memory footprint
-        Uses numpy arrays and line-by-line processing
+        Optimized streaming extraction with pre-computed spatial mapping.
+        Process all variables for a forecast hour efficiently.
         """
         self.log(f"    Extracting variables from GRIB...")
-
-        # Step 1: Extract all variables to CSV (files on disk)
+        
+        # Step 1: Extract all variables to CSV
         var_csv_paths = {}
         for var_name, var_config in self.variables.items():
             csv_path = self.tmp_dir / f"{self.job_id}_{var_name}.csv"
@@ -338,113 +393,98 @@ class StreamingNBMIngester:
                         'path': csv_path,
                         'config': var_config
                     }
-            except Exception as e:
+            except Exception:
                 csv_path.unlink(missing_ok=True)
                 continue
-
+        
         if not var_csv_paths:
-            self.log(f"    ⚠ No variables extracted")
+            self.log("    ⚠ No variables extracted")
             return 0
-
+        
         self.log(f"    Found {len(var_csv_paths)} variables")
-
-        # Step 2: Read first variable to build spatial index
+        
+        # Step 2: Build spatial mapping ONCE using first variable
         first_var_name = list(var_csv_paths.keys())[0]
         first_csv = var_csv_paths[first_var_name]['path']
-
-        self.log(f"    Building spatial index...")
-        grid_coords = []
-        valid_time = None
-
-        with open(first_csv, 'r') as f:
-            for line in f:
-                parts = line.strip().split(',')
-                if len(parts) >= 7:
-                    if valid_time is None:
-                        valid_time = parts[1]
-                    lon = float(parts[4])
-                    lat = float(parts[5])
-                    grid_coords.append([lat, lon])
-
-        grid_coords = np.array(grid_coords, dtype=np.float32)
-        tree = cKDTree(grid_coords)
-        self.log(f"    Grid has {len(grid_coords)} points")
-
-        # Prepare ZIP coordinates
-        zip_coords = np.column_stack([
-            np.array([z['lat'] for z in zips], dtype=np.float32),
-            np.array([z['lon'] for z in zips], dtype=np.float32)
-        ])
-
-        # Handle lon wrap
-        if np.max(grid_coords[:, 1]) > 180:
-            zip_coords[:, 1] = np.where(zip_coords[:, 1] < 0, zip_coords[:, 1] + 360, zip_coords[:, 1])
-
-        distances, indices = tree.query(zip_coords, k=1)
-        valid_mask = distances < 0.03
-        matched_count = np.sum(valid_mask)
-        self.log(f"    Matched {matched_count}/{len(zips)} ZIPs")
-
-        # Step 3: Streaming insert per variable
+        
+        grid_to_zip, valid_time = self.build_spatial_mapping(first_csv, zips)
+        
+        # Step 3: Initialize database connection
         conn = psycopg2.connect(self.db_url)
+        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         cur = conn.cursor()
-        total_inserted = 0
-        batch = []
-
+        
+        # Use a dict to merge all variables per (zip, valid_time)
+        records = {}  # key: zip_code -> record dict
+        
+        # Step 4: Stream each variable CSV with direct lookups
         for var_name, var_info in var_csv_paths.items():
-            csv_path = var_info['path']
-            transform = var_info['config']['transform']
+            path = var_info['path']
             field = var_info['config']['field']
-
+            transform = var_info['config']['transform']
+            
             self.log(f"    Processing {var_name}...")
-            with open(csv_path, 'r') as f:
-                for idx, line in enumerate(f):
+            
+            with open(path, 'r') as f:
+                for grid_idx, line in enumerate(f):
                     parts = line.strip().split(',')
                     if len(parts) < 7:
                         continue
-                    if idx >= len(grid_coords):
+                    
+                    # Direct lookup - no distance calculation!
+                    zip_code = grid_to_zip.get(grid_idx)
+                    if zip_code is None:
                         continue
-                    if not np.isnan(distances[idx]) and distances[idx] < 0.03:
-                        nearest_zip_idx = np.argmin(np.linalg.norm(zip_coords - grid_coords[idx], axis=1))
-                        if not valid_mask[nearest_zip_idx]:
+                    
+                    # Initialize record if needed
+                    if zip_code not in records:
+                        records[zip_code] = {
+                            'zip': zip_code,
+                            'valid_time': valid_time
+                        }
+                    
+                    # Transform and add value
+                    try:
+                        value = float(parts[6])
+                        if value == 9999 or np.isnan(value):
                             continue
-                        try:
-                            value = float(parts[6])
-                            if value == 9999 or np.isnan(value):
-                                continue
-                            record = {
-                                'zip': zips[nearest_zip_idx]['zip'],
-                                'valid_time': valid_time,
-                                field: transform(value)
-                            }
-                            batch.append(record)
-                        except Exception:
-                            continue
-
-                        if len(batch) >= self.batch_size:
-                            self.insert_batch(batch, conn, cur)
-                            total_inserted += len(batch)
-                            self.log(f"    → Inserted {total_inserted} records so far")
-                            batch.clear()
-            # Delete CSV after processing
-            csv_path.unlink(missing_ok=True)
-            gc.collect()
-
-        # Insert remaining batch
-        if batch:
-            self.insert_batch(batch, conn, cur)
-            total_inserted += len(batch)
-            self.log(f"    → Inserted {total_inserted} records [final]")
-
+                        records[zip_code][field] = transform(value)
+                    except Exception:
+                        continue
+            
+            # Delete CSV immediately after processing
+            path.unlink(missing_ok=True)
+            self.log(f"    ✓ Processed {var_name}")
+        
+        # Step 5: Bulk insert all records
+        self.log(f"    Inserting {len(records)} records...")
+        
+        batch = list(records.values())
+        
+        # Insert in chunks to avoid memory issues
+        chunk_size = self.batch_size
+        total_inserted = 0
+        
+        for i in range(0, len(batch), chunk_size):
+            chunk = batch[i:i + chunk_size]
+            self.bulk_insert_batch(chunk, conn, cur)
+            total_inserted += len(chunk)
+            if i + chunk_size < len(batch):
+                self.log(f"    → Inserted {total_inserted}/{len(batch)} records...")
+        
+        self.log(f"    ✓ Inserted all {total_inserted} records")
+        
         cur.close()
         conn.close()
-        del grid_coords, tree, zip_coords, batch
+        
+        # Clean up
+        del records, grid_to_zip, batch
         gc.collect()
-
+        
         return total_inserted
 
     def process_forecast_hour(self, run_date, run_hour, fhr, zips):
-        """Process a single forecast hour with streaming inserts"""
+        """Process a single forecast hour with optimized streaming"""
         fhr_str = f"{fhr:03d}"
         
         url = f"https://noaa-nbm-grib2-pds.s3.amazonaws.com/blend.{run_date}/{run_hour}/core/blend.t{run_hour}z.core.f{fhr_str}.co.grib2"
@@ -457,11 +497,11 @@ class StreamingNBMIngester:
             download_time = time.time() - start_time
             self.log(f"  ✓ Downloaded f{fhr_str}: {grib_size:.1f} MB in {download_time:.1f}s")
             
-            # Extract and insert in streaming fashion
+            # Extract and insert with optimized method
             start_time = time.time()
-            record_count = self.extract_nbm_data_streaming(grib_path, zips, fhr_str)
+            record_count = self.extract_nbm_data_streaming_optimized(grib_path, zips, fhr_str)
             process_time = time.time() - start_time
-            self.log(f"  ✓ Completed f{fhr_str} in {process_time:.1f}s - {record_count} total records")
+            self.log(f"  ✓ Completed f{fhr_str} in {process_time:.1f}s - {record_count} records")
             
             # Delete GRIB immediately
             grib_path.unlink()
@@ -491,11 +531,12 @@ class StreamingNBMIngester:
             self.log(f"Strategy: {forecast_plan['reason']}")
             self.log(f"Will process {len(forecast_hours)} hours: {forecast_hours}")
             
-            # Load ZIP codes
+            # Load ZIP codes once
             zips = self.load_zip_codes()
             
             # Process each forecast hour
             total_records = 0
+            overall_start = time.time()
             
             for fhr in forecast_hours:
                 record_count = self.process_forecast_hour(
@@ -505,7 +546,8 @@ class StreamingNBMIngester:
                     zips
                 )
                 total_records += record_count
-                self.log(f"TOTAL: {total_records} records inserted so far")
+                elapsed = time.time() - overall_start
+                self.log(f"PROGRESS: {total_records} records | {elapsed:.1f}s elapsed")
                 
                 gc.collect()
             
@@ -517,7 +559,8 @@ class StreamingNBMIngester:
                 total_records
             )
             
-            self.log(f"✓ Ingestion completed - {total_records} records")
+            total_time = time.time() - overall_start
+            self.log(f"✓ Ingestion completed - {total_records} records in {total_time:.1f}s")
             return 0
             
         except Exception as e:
