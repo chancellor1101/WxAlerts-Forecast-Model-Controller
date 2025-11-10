@@ -3,7 +3,7 @@ version: '3.8'
 services:
   nbm-ingester:
     build: .
-    image: wxalerts/nbm-ingester:latest
+    image: ghcr.io/chancellor1101/nbm-ingester
     container_name: nbm-ingester
     
     environment:

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-ingest_nbm_smart.py - Intelligent NBM ingestion
+ingest_nbm_smart_memory_optimized.py - Intelligent NBM ingestion with memory optimization
 Only downloads NEW model runs and UPDATED forecast hours
+Inserts data IMMEDIATELY to avoid OOM
 """
 
 import os
 import sys
 import json
+import gc
 import time
 import subprocess
 from datetime import datetime, timedelta
@@ -237,7 +239,6 @@ class SmartNBMIngester:
                    ST_X(centroid::geometry) as lon,
                    ST_Y(centroid::geometry) as lat
             FROM zipcodes
-            WHERE "stateId" NOT IN ('AK', 'HI', 'PR', 'VI', 'GU')
             ORDER BY code
         """)
         
@@ -271,6 +272,7 @@ class SmartNBMIngester:
     
     def extract_variable_csv(self, grib_path, pattern, csv_path):
         """Extract a single variable to CSV using wgrib2"""
+        # Use the wgrib2 that is included with this container
         cmd = f"./wgrib2 '{grib_path}' -match '{pattern}' -csv '{csv_path}'"
         
         result = subprocess.run(
@@ -297,7 +299,7 @@ class SmartNBMIngester:
         return df
     
     def extract_nbm_data(self, grib_path, zips):
-        """Extract NBM data using wgrib2 CSV output"""
+        """Extract NBM data using wgrib2 CSV output - MEMORY OPTIMIZED"""
         
         var_data = {}
         valid_time = None
@@ -331,7 +333,7 @@ class SmartNBMIngester:
                     'config': var_config
                 }
                 
-                # Clean up CSV
+                # Clean up CSV IMMEDIATELY
                 csv_path.unlink(missing_ok=True)
                 
             except Exception as e:
@@ -393,6 +395,10 @@ class SmartNBMIngester:
             
             results.append(record)
         
+        # Cleanup DataFrames
+        del var_data
+        gc.collect()
+        
         return results
     
     def insert_to_database(self, records):
@@ -450,55 +456,8 @@ class SmartNBMIngester:
         
         self.log(f"✓ Database updated with {len(records)} records")
     
-    def update_redis_cache(self, records, zips):
-        """Update Redis cache for hot ZIP codes"""
-        if not self.redis_client or not records:
-            return
-        
-        self.log("Updating Redis cache...")
-        
-        # Group records by ZIP
-        records_by_zip = {}
-        for record in records:
-            zip_code = record['zip']
-            if zip_code not in records_by_zip:
-                records_by_zip[zip_code] = []
-            records_by_zip[zip_code].append(record)
-        
-        # Get hot ZIPs (first N by order)
-        hot_zip_codes = set([z['zip'] for z in zips[:self.hot_zips]])
-        
-        # Create ZIP lookup
-        zip_lookup = {z['zip']: z for z in zips}
-        
-        # Update cache for hot ZIPs
-        cached_count = 0
-        for zip_code, forecasts in records_by_zip.items():
-            if zip_code in hot_zip_codes:
-                zip_data = zip_lookup.get(zip_code)
-                if zip_data:
-                    # Sort forecasts by time
-                    forecasts.sort(key=lambda x: x['valid_time'])
-                    
-                    cache_data = {
-                        'zip': zip_code,
-                        'city': zip_data['city'],
-                        'state': zip_data['state'],
-                        'forecast': forecasts,
-                        'updated': datetime.utcnow().isoformat() + 'Z'
-                    }
-                    
-                    self.redis_client.setex(
-                        f"fc:{zip_code}",
-                        3600,  # 1 hour expiry
-                        json.dumps(cache_data)
-                    )
-                    cached_count += 1
-        
-        self.log(f"✓ Cached {cached_count} hot ZIPs to Redis")
-    
     def process_forecast_hour(self, run_date, run_hour, fhr, zips):
-        """Process a single forecast hour"""
+        """Process a single forecast hour - INSERT IMMEDIATELY"""
         fhr_str = f"{fhr:03d}"
         
         url = f"https://noaa-nbm-grib2-pds.s3.amazonaws.com/blend.{run_date}/{run_hour}/core/blend.t{run_hour}z.core.f{fhr_str}.co.grib2"
@@ -517,17 +476,29 @@ class SmartNBMIngester:
             process_time = time.time() - start_time
             self.log(f"  ✓ Processed f{fhr_str} in {process_time:.1f}s - {len(records)} records")
             
-            # Cleanup
+            # INSERT IMMEDIATELY - don't accumulate in memory
+            if records:
+                start_time = time.time()
+                self.insert_to_database(records)
+                insert_time = time.time() - start_time
+                self.log(f"  ✓ Inserted {len(records)} records in {insert_time:.1f}s")
+            
+            # Cleanup GRIB IMMEDIATELY
             grib_path.unlink()
             
-            return records
+            # Force garbage collection
+            record_count = len(records)
+            del records
+            gc.collect()
+            
+            return record_count
             
         except Exception as e:
             self.log(f"  ✗ Failed f{fhr_str}: {str(e)}")
             # Cleanup on error
             if grib_path.exists():
                 grib_path.unlink()
-            return []
+            return 0
 
     def run(self):
         """Main ingestion process with intelligent update strategy"""
@@ -543,38 +514,34 @@ class SmartNBMIngester:
             self.log(f"Strategy: {forecast_plan['reason']}")
             self.log(f"Will process {len(forecast_hours)} forecast hours: {forecast_hours}")
             
-            # Load ZIP codes
+            # Load ZIP codes ONCE
             zips = self.load_zip_codes()
             
             # Process each forecast hour
-            all_records = []
+            total_records = 0
             
             for fhr in forecast_hours:
-                records = self.process_forecast_hour(
+                record_count = self.process_forecast_hour(
                     cycle['run_date'],
                     cycle['run_hour'],
                     fhr,
                     zips
                 )
-                all_records.extend(records)
-                self.log(f"Total records so far: {len(all_records)}")
-            
-            # Insert to database
-            self.log(f"Inserting {len(all_records)} records to database...")
-            self.insert_to_database(all_records)
+                total_records += record_count
+                self.log(f"Total records inserted: {total_records}")
+                
+                # Force garbage collection between hours
+                gc.collect()
             
             # Log this run
             self.log_ingestion_run(
                 cycle['run_date'],
                 cycle['run_hour'],
                 forecast_hours,
-                len(all_records)
+                total_records
             )
             
-            # Update Redis cache
-            self.update_redis_cache(all_records, zips)
-            
-            self.log("✓ Ingestion completed successfully")
+            self.log(f"✓ Ingestion completed - {total_records} total records")
             return 0
             
         except Exception as e:
