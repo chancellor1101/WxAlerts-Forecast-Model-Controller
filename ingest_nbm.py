@@ -271,7 +271,7 @@ class SmartNBMIngester:
     
     def extract_variable_csv(self, grib_path, pattern, csv_path):
         """Extract a single variable to CSV using wgrib2"""
-        cmd = f"wgrib2 '{grib_path}' -match '{pattern}' -csv '{csv_path}'"
+        cmd = f"./wgrib2 '{grib_path}' -match '{pattern}' -csv '{csv_path}'"
         
         result = subprocess.run(
             cmd,
