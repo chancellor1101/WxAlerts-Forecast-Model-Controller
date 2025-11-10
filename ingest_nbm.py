@@ -320,53 +320,42 @@ class StreamingNBMIngester:
         ])
         return df
     
-    def extract_nbm_data_streaming(self, grib_path, zips, fhr_str):
+    def extract_nbm_data_streaming_optimized(self, grib_path, zips, fhr_str):
         """
         ULTRA STREAMING extraction - minimal memory footprint
-        Uses dict lookups instead of DataFrames
+        Uses numpy arrays and line-by-line processing
         """
-        
         self.log(f"    Extracting variables from GRIB...")
-        
+
         # Step 1: Extract all variables to CSV (files on disk)
         var_csv_paths = {}
-        
         for var_name, var_config in self.variables.items():
             csv_path = self.tmp_dir / f"{self.job_id}_{var_name}.csv"
-            
             try:
-                result_path = self.extract_variable_csv(
-                    grib_path,
-                    var_config['pattern'],
-                    csv_path
-                )
-                
+                result_path = self.extract_variable_csv(grib_path, var_config['pattern'], csv_path)
                 if result_path and csv_path.exists():
                     var_csv_paths[var_name] = {
                         'path': csv_path,
                         'config': var_config
                     }
-                
             except Exception as e:
                 csv_path.unlink(missing_ok=True)
                 continue
-        
+
         if not var_csv_paths:
             self.log(f"    ⚠ No variables extracted")
             return 0
-        
+
         self.log(f"    Found {len(var_csv_paths)} variables")
-        
-        # Step 2: Read FIRST variable ONLY to build spatial index
+
+        # Step 2: Read first variable to build spatial index
         first_var_name = list(var_csv_paths.keys())[0]
         first_csv = var_csv_paths[first_var_name]['path']
-        
+
         self.log(f"    Building spatial index...")
-        
         grid_coords = []
         valid_time = None
-        
-        # Read first CSV line by line - only keep coords
+
         with open(first_csv, 'r') as f:
             for line in f:
                 parts = line.strip().split(',')
@@ -376,122 +365,84 @@ class StreamingNBMIngester:
                     lon = float(parts[4])
                     lat = float(parts[5])
                     grid_coords.append([lat, lon])
-        
-        grid_coords = np.array(grid_coords)
+
+        grid_coords = np.array(grid_coords, dtype=np.float32)
         tree = cKDTree(grid_coords)
-        
         self.log(f"    Grid has {len(grid_coords)} points")
-        
+
         # Prepare ZIP coordinates
-        zip_lats = np.array([z['lat'] for z in zips])
-        zip_lons = np.array([z['lon'] for z in zips])
-        
+        zip_coords = np.column_stack([
+            np.array([z['lat'] for z in zips], dtype=np.float32),
+            np.array([z['lon'] for z in zips], dtype=np.float32)
+        ])
+
+        # Handle lon wrap
         if np.max(grid_coords[:, 1]) > 180:
-            zip_lons = np.where(zip_lons < 0, zip_lons + 360, zip_lons)
-        
-        zip_coords = np.column_stack([zip_lats, zip_lons])
-        
-        # Query tree
+            zip_coords[:, 1] = np.where(zip_coords[:, 1] < 0, zip_coords[:, 1] + 360, zip_coords[:, 1])
+
         distances, indices = tree.query(zip_coords, k=1)
         valid_mask = distances < 0.03
-        
         matched_count = np.sum(valid_mask)
         self.log(f"    Matched {matched_count}/{len(zips)} ZIPs")
-        
-        # Step 3: For each variable, create minimal lookup
-        self.log(f"    Reading variable values...")
-        
-        var_lookups = {}
-        
-        for var_name, var_info in var_csv_paths.items():
-            csv_path = var_info['path']
-            config = var_info['config']
-            transform = config['transform']
-            
-            # Read CSV line by line, store only index->value
-            value_lookup = {}
-            
-            with open(csv_path, 'r') as f:
-                idx = 0
-                for line in f:
-                    parts = line.strip().split(',')
-                    if len(parts) >= 7:
-                        try:
-                            value = float(parts[6])
-                            if not np.isnan(value) and value != 9999:
-                                value_lookup[idx] = transform(value)
-                        except:
-                            pass
-                        idx += 1
-            
-            var_lookups[var_name] = {
-                'lookup': value_lookup,
-                'field': config['field']
-            }
-            
-            # Delete CSV immediately
-            csv_path.unlink(missing_ok=True)
-            self.log(f"      {var_name}: {len(value_lookup)} valid values")
-        
-        # Cleanup
-        del grid_coords, tree
-        gc.collect()
-        
-        self.log(f"    Streaming inserts in batches of {self.batch_size}...")
-        
-        # Step 4: Stream through ZIPs and insert
+
+        # Step 3: Streaming insert per variable
         conn = psycopg2.connect(self.db_url)
         cur = conn.cursor()
-        
-        batch = []
         total_inserted = 0
-        
-        for i in range(len(zips)):
-            if not valid_mask[i]:
-                continue
-            
-            idx = int(indices[i])
-            zip_data = zips[i]
-            
-            record = {
-                'zip': zip_data['zip'],
-                'valid_time': valid_time
-            }
-            
-            # Extract values from lookups
-            for var_name, var_info in var_lookups.items():
-                lookup = var_info['lookup']
-                field = var_info['field']
-                
-                if idx in lookup:
-                    record[field] = lookup[idx]
-            
-            batch.append(record)
-            
-            # INSERT BATCH
-            if len(batch) >= self.batch_size:
-                self.insert_batch(batch, conn, cur)
-                total_inserted += len(batch)
-                self.log(f"    → Inserted {total_inserted} records (f{fhr_str})")
-                
-                batch = []
-                gc.collect()
-        
-        # Insert remaining
+        batch = []
+
+        for var_name, var_info in var_csv_paths.items():
+            csv_path = var_info['path']
+            transform = var_info['config']['transform']
+            field = var_info['config']['field']
+
+            self.log(f"    Processing {var_name}...")
+            with open(csv_path, 'r') as f:
+                for idx, line in enumerate(f):
+                    parts = line.strip().split(',')
+                    if len(parts) < 7:
+                        continue
+                    if idx >= len(grid_coords):
+                        continue
+                    if not np.isnan(distances[idx]) and distances[idx] < 0.03:
+                        nearest_zip_idx = np.argmin(np.linalg.norm(zip_coords - grid_coords[idx], axis=1))
+                        if not valid_mask[nearest_zip_idx]:
+                            continue
+                        try:
+                            value = float(parts[6])
+                            if value == 9999 or np.isnan(value):
+                                continue
+                            record = {
+                                'zip': zips[nearest_zip_idx]['zip'],
+                                'valid_time': valid_time,
+                                field: transform(value)
+                            }
+                            batch.append(record)
+                        except Exception:
+                            continue
+
+                        if len(batch) >= self.batch_size:
+                            self.insert_batch(batch, conn, cur)
+                            total_inserted += len(batch)
+                            self.log(f"    → Inserted {total_inserted} records so far")
+                            batch.clear()
+            # Delete CSV after processing
+            csv_path.unlink(missing_ok=True)
+            gc.collect()
+
+        # Insert remaining batch
         if batch:
             self.insert_batch(batch, conn, cur)
             total_inserted += len(batch)
-            self.log(f"    → Inserted {total_inserted} records (f{fhr_str}) [final]")
-        
+            self.log(f"    → Inserted {total_inserted} records [final]")
+
         cur.close()
         conn.close()
-        
-        # Final cleanup
-        del var_lookups
+        del grid_coords, tree, zip_coords, batch
         gc.collect()
-        
+
         return total_inserted
-    
+
     def process_forecast_hour(self, run_date, run_hour, fhr, zips):
         """Process a single forecast hour with streaming inserts"""
         fhr_str = f"{fhr:03d}"
