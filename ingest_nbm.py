@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-ingest_nbm_smart_memory_optimized.py - Intelligent NBM ingestion with memory optimization
-Only downloads NEW model runs and UPDATED forecast hours
-Inserts data IMMEDIATELY to avoid OOM
+ingest_nbm_streaming.py - Ultra-low memory NBM ingestion
+Streams data in mini-batches of 100 records to minimize memory usage
 """
 
 import os
 import sys
-import json
 import gc
 import time
 import subprocess
@@ -22,7 +20,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 
-class SmartNBMIngester:
+class StreamingNBMIngester:
     def __init__(self):
         self.job_id = f"nbm_{int(time.time())}"
         self.tmp_dir = Path(os.environ.get('TMP_DIR', '/tmp/nbm'))
@@ -46,6 +44,7 @@ class SmartNBMIngester:
         
         # Configuration
         self.hot_zips = int(os.environ.get('HOT_ZIPS', '5000'))
+        self.batch_size = 100  # Insert every 100 records
         
         # Variable definitions
         self.variables = {
@@ -104,10 +103,7 @@ class SmartNBMIngester:
         return ms * 2.23694
     
     def get_latest_nbm_cycle(self):
-        """
-        Determine the latest available NBM cycle.
-        NBM runs at 00z, 06z, 12z, 18z and is typically available 3 hours after run time.
-        """
+        """Determine the latest available NBM cycle"""
         now = datetime.utcnow()
         cycles = [0, 6, 12, 18]
         run_hour = cycles[-1]
@@ -135,7 +131,6 @@ class SmartNBMIngester:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
             
-            # Get the most recent run_date/run_hour we've processed
             cur.execute("""
                 SELECT run_date, run_hour 
                 FROM nbm_ingestion_log 
@@ -156,7 +151,7 @@ class SmartNBMIngester:
             return None
             
         except Exception as e:
-            self.log(f"Could not fetch last run (table may not exist): {e}")
+            self.log(f"Could not fetch last run: {e}")
             return None
     
     def log_ingestion_run(self, run_date, run_hour, forecast_hours, record_count):
@@ -165,7 +160,6 @@ class SmartNBMIngester:
             conn = psycopg2.connect(self.db_url)
             cur = conn.cursor()
             
-            # Create log table if it doesn't exist
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS nbm_ingestion_log (
                     id SERIAL PRIMARY KEY,
@@ -178,7 +172,6 @@ class SmartNBMIngester:
                 )
             """)
             
-            # Insert this run
             cur.execute("""
                 INSERT INTO nbm_ingestion_log 
                     (run_date, run_hour, forecast_hours, record_count)
@@ -195,36 +188,26 @@ class SmartNBMIngester:
             conn.close()
             
         except Exception as e:
-            self.log(f"Warning: Could not log ingestion run: {e}")
+            self.log(f"Warning: Could not log run: {e}")
     
     def determine_forecast_hours_to_process(self, current_run):
-        """
-        Intelligently determine which forecast hours to process.
-        
-        Strategy:
-        1. If this is a NEW model run → download all forecast hours (f001-f036)
-        2. If running within same model cycle → only download SHORT RANGE updates (f001-f006)
-           (because near-term forecasts get better/updated, long-range stays same)
-        """
+        """Determine which forecast hours to process"""
         last_run = self.get_last_processed_run()
         
-        # First run ever OR new model cycle
         if not last_run or \
            last_run['run_date'] != current_run['run_date'] or \
            last_run['run_hour'] != current_run['run_hour']:
             
-            self.log("📥 NEW MODEL RUN detected - downloading full forecast")
+            self.log("📥 NEW MODEL RUN - downloading full forecast")
             return {
                 'reason': 'new_run',
                 'hours': [1, 2, 3, 4, 5, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36]
             }
-        
-        # Same model run, just updating near-term forecasts
         else:
-            self.log("🔄 Same model run - updating near-term forecasts only")
+            self.log("🔄 Same run - updating near-term only")
             return {
                 'reason': 'update',
-                'hours': [1, 2, 3, 4, 5, 6]  # Only first 6 hours
+                'hours': [1, 2, 3, 4, 5, 6]
             }
     
     def load_zip_codes(self):
@@ -270,147 +253,11 @@ class SmartNBMIngester:
         size_mb = len(data) / (1024 * 1024)
         return size_mb
     
-    def extract_variable_csv(self, grib_path, pattern, csv_path):
-        """Extract a single variable to CSV using wgrib2"""
-        # Use the wgrib2 that is included with this container
-        cmd = f"./wgrib2 '{grib_path}' -match '{pattern}' -csv '{csv_path}'"
-        
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=120
-        )
-        
-        if result.returncode != 0:
-            raise RuntimeError(f"wgrib2 extraction failed: {result.stderr}")
-        
-        if not csv_path.exists() or csv_path.stat().st_size == 0:
-            return None
-        
-        return csv_path
-    
-    def read_wgrib2_csv(self, csv_file):
-        """Read wgrib2 CSV output into a DataFrame"""
-        df = pd.read_csv(csv_file, header=None, names=[
-            'ref_time', 'valid_time', 'var', 'level', 'lon', 'lat', 'value'
-        ])
-        return df
-    
-    def extract_nbm_data(self, grib_path, zips):
-        """Extract NBM data using wgrib2 CSV output - MEMORY OPTIMIZED"""
-        
-        var_data = {}
-        valid_time = None
-        
-        # Extract each variable
-        for var_name, var_config in self.variables.items():
-            csv_path = self.tmp_dir / f"{self.job_id}_{var_name}.csv"
-            
-            try:
-                result_path = self.extract_variable_csv(
-                    grib_path,
-                    var_config['pattern'],
-                    csv_path
-                )
-                
-                if not result_path:
-                    continue
-                
-                df = self.read_wgrib2_csv(csv_path)
-                
-                if len(df) == 0:
-                    csv_path.unlink(missing_ok=True)
-                    continue
-                
-                # Get valid time from first variable
-                if valid_time is None:
-                    valid_time = df['valid_time'].iloc[0]
-                
-                var_data[var_name] = {
-                    'df': df,
-                    'config': var_config
-                }
-                
-                # Clean up CSV IMMEDIATELY
-                csv_path.unlink(missing_ok=True)
-                
-            except Exception as e:
-                csv_path.unlink(missing_ok=True)
-                continue
-        
-        if not var_data:
-            return []
-        
-        # Use first variable's grid for KDTree
-        first_var = list(var_data.values())[0]['df']
-        grid_lats = first_var['lat'].values
-        grid_lons = first_var['lon'].values
-        grid_coords = np.column_stack([grid_lats, grid_lons])
-        
-        tree = cKDTree(grid_coords)
-        
-        # Prepare ZIP coordinates
-        zip_lats = np.array([z['lat'] for z in zips])
-        zip_lons = np.array([z['lon'] for z in zips])
-        
-        # Handle longitude wrap (if grid uses 0-360)
-        if np.max(grid_lons) > 180:
-            zip_lons = np.where(zip_lons < 0, zip_lons + 360, zip_lons)
-        
-        zip_coords = np.column_stack([zip_lats, zip_lons])
-        
-        distances, indices = tree.query(zip_coords, k=1)
-        valid_mask = distances < 0.03
-        
-        # Build results
-        results = []
-        
-        for i in range(len(zips)):
-            if not valid_mask[i]:
-                continue
-            
-            idx = int(indices[i])  # Convert numpy.int64 to Python int
-            zip_data = zips[i]
-            
-            record = {
-                'zip': zip_data['zip'],
-                'valid_time': valid_time
-            }
-            
-            # Extract values for each variable
-            for var_name, var_info in var_data.items():
-                df = var_info['df']
-                config = var_info['config']
-                transform = config['transform']
-                field = config['field']
-                
-                try:
-                    value = float(df.iloc[idx]['value'])  # Convert to Python float
-                    if not np.isnan(value) and value != 9999:
-                        record[field] = transform(value)
-                except:
-                    pass
-            
-            results.append(record)
-        
-        # Cleanup DataFrames
-        del var_data
-        gc.collect()
-        
-        return results
-    
-    def insert_to_database(self, records):
-        """Bulk insert records to database"""
-        if not records:
-            self.log("No records to insert")
+    def insert_batch(self, batch, conn, cur):
+        """Insert a batch of records"""
+        if not batch:
             return
         
-        conn = psycopg2.connect(self.db_url)
-        cur = conn.cursor()
-        
-        # Prepare data for bulk insert
         values = [
             (
                 r['zip'],
@@ -423,10 +270,9 @@ class SmartNBMIngester:
                 r.get('vis_mi'),
                 r.get('cape')
             )
-            for r in records
+            for r in batch
         ]
         
-        # Upsert query
         query = """
             INSERT INTO forecasts (
                 zip, valid_time, temp_f, rh_pct, wind_mph, 
@@ -444,20 +290,210 @@ class SmartNBMIngester:
                 cape = EXCLUDED.cape
         """
         
-        # Insert in chunks
-        chunk_size = 5000
-        for i in range(0, len(values), chunk_size):
-            chunk = values[i:i + chunk_size]
-            execute_values(cur, query, chunk)
-            conn.commit()
+        execute_values(cur, query, values)
+        conn.commit()
+    
+    def extract_variable_csv(self, grib_path, pattern, csv_path):
+        """Extract a single variable to CSV using wgrib2"""
+        cmd = f"wgrib2 '{grib_path}' -match '{pattern}' -csv '{csv_path}'"
+        
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"wgrib2 failed: {result.stderr}")
+        
+        if not csv_path.exists() or csv_path.stat().st_size == 0:
+            return None
+        
+        return csv_path
+    
+    def read_wgrib2_csv(self, csv_file):
+        """Read wgrib2 CSV output"""
+        df = pd.read_csv(csv_file, header=None, names=[
+            'ref_time', 'valid_time', 'var', 'level', 'lon', 'lat', 'value'
+        ])
+        return df
+    
+    def extract_nbm_data_streaming(self, grib_path, zips, fhr_str):
+        """
+        ULTRA STREAMING extraction - minimal memory footprint
+        Uses dict lookups instead of DataFrames
+        """
+        
+        self.log(f"    Extracting variables from GRIB...")
+        
+        # Step 1: Extract all variables to CSV (files on disk)
+        var_csv_paths = {}
+        
+        for var_name, var_config in self.variables.items():
+            csv_path = self.tmp_dir / f"{self.job_id}_{var_name}.csv"
+            
+            try:
+                result_path = self.extract_variable_csv(
+                    grib_path,
+                    var_config['pattern'],
+                    csv_path
+                )
+                
+                if result_path and csv_path.exists():
+                    var_csv_paths[var_name] = {
+                        'path': csv_path,
+                        'config': var_config
+                    }
+                
+            except Exception as e:
+                csv_path.unlink(missing_ok=True)
+                continue
+        
+        if not var_csv_paths:
+            self.log(f"    ⚠ No variables extracted")
+            return 0
+        
+        self.log(f"    Found {len(var_csv_paths)} variables")
+        
+        # Step 2: Read FIRST variable ONLY to build spatial index
+        first_var_name = list(var_csv_paths.keys())[0]
+        first_csv = var_csv_paths[first_var_name]['path']
+        
+        self.log(f"    Building spatial index...")
+        
+        grid_coords = []
+        valid_time = None
+        
+        # Read first CSV line by line - only keep coords
+        with open(first_csv, 'r') as f:
+            for line in f:
+                parts = line.strip().split(',')
+                if len(parts) >= 7:
+                    if valid_time is None:
+                        valid_time = parts[1]
+                    lon = float(parts[4])
+                    lat = float(parts[5])
+                    grid_coords.append([lat, lon])
+        
+        grid_coords = np.array(grid_coords)
+        tree = cKDTree(grid_coords)
+        
+        self.log(f"    Grid has {len(grid_coords)} points")
+        
+        # Prepare ZIP coordinates
+        zip_lats = np.array([z['lat'] for z in zips])
+        zip_lons = np.array([z['lon'] for z in zips])
+        
+        if np.max(grid_coords[:, 1]) > 180:
+            zip_lons = np.where(zip_lons < 0, zip_lons + 360, zip_lons)
+        
+        zip_coords = np.column_stack([zip_lats, zip_lons])
+        
+        # Query tree
+        distances, indices = tree.query(zip_coords, k=1)
+        valid_mask = distances < 0.03
+        
+        matched_count = np.sum(valid_mask)
+        self.log(f"    Matched {matched_count}/{len(zips)} ZIPs")
+        
+        # Step 3: For each variable, create minimal lookup
+        self.log(f"    Reading variable values...")
+        
+        var_lookups = {}
+        
+        for var_name, var_info in var_csv_paths.items():
+            csv_path = var_info['path']
+            config = var_info['config']
+            transform = config['transform']
+            
+            # Read CSV line by line, store only index->value
+            value_lookup = {}
+            
+            with open(csv_path, 'r') as f:
+                idx = 0
+                for line in f:
+                    parts = line.strip().split(',')
+                    if len(parts) >= 7:
+                        try:
+                            value = float(parts[6])
+                            if not np.isnan(value) and value != 9999:
+                                value_lookup[idx] = transform(value)
+                        except:
+                            pass
+                        idx += 1
+            
+            var_lookups[var_name] = {
+                'lookup': value_lookup,
+                'field': config['field']
+            }
+            
+            # Delete CSV immediately
+            csv_path.unlink(missing_ok=True)
+            self.log(f"      {var_name}: {len(value_lookup)} valid values")
+        
+        # Cleanup
+        del grid_coords, tree
+        gc.collect()
+        
+        self.log(f"    Streaming inserts in batches of {self.batch_size}...")
+        
+        # Step 4: Stream through ZIPs and insert
+        conn = psycopg2.connect(self.db_url)
+        cur = conn.cursor()
+        
+        batch = []
+        total_inserted = 0
+        
+        for i in range(len(zips)):
+            if not valid_mask[i]:
+                continue
+            
+            idx = int(indices[i])
+            zip_data = zips[i]
+            
+            record = {
+                'zip': zip_data['zip'],
+                'valid_time': valid_time
+            }
+            
+            # Extract values from lookups
+            for var_name, var_info in var_lookups.items():
+                lookup = var_info['lookup']
+                field = var_info['field']
+                
+                if idx in lookup:
+                    record[field] = lookup[idx]
+            
+            batch.append(record)
+            
+            # INSERT BATCH
+            if len(batch) >= self.batch_size:
+                self.insert_batch(batch, conn, cur)
+                total_inserted += len(batch)
+                self.log(f"    → Inserted {total_inserted} records (f{fhr_str})")
+                
+                batch = []
+                gc.collect()
+        
+        # Insert remaining
+        if batch:
+            self.insert_batch(batch, conn, cur)
+            total_inserted += len(batch)
+            self.log(f"    → Inserted {total_inserted} records (f{fhr_str}) [final]")
         
         cur.close()
         conn.close()
         
-        self.log(f"✓ Database updated with {len(records)} records")
+        # Final cleanup
+        del var_lookups
+        gc.collect()
+        
+        return total_inserted
     
     def process_forecast_hour(self, run_date, run_hour, fhr, zips):
-        """Process a single forecast hour - INSERT IMMEDIATELY"""
+        """Process a single forecast hour with streaming inserts"""
         fhr_str = f"{fhr:03d}"
         
         url = f"https://noaa-nbm-grib2-pds.s3.amazonaws.com/blend.{run_date}/{run_hour}/core/blend.t{run_hour}z.core.f{fhr_str}.co.grib2"
@@ -470,38 +506,28 @@ class SmartNBMIngester:
             download_time = time.time() - start_time
             self.log(f"  ✓ Downloaded f{fhr_str}: {grib_size:.1f} MB in {download_time:.1f}s")
             
-            # Extract data directly from GRIB using CSV
+            # Extract and insert in streaming fashion
             start_time = time.time()
-            records = self.extract_nbm_data(grib_path, zips)
+            record_count = self.extract_nbm_data_streaming(grib_path, zips, fhr_str)
             process_time = time.time() - start_time
-            self.log(f"  ✓ Processed f{fhr_str} in {process_time:.1f}s - {len(records)} records")
+            self.log(f"  ✓ Completed f{fhr_str} in {process_time:.1f}s - {record_count} total records")
             
-            # INSERT IMMEDIATELY - don't accumulate in memory
-            if records:
-                start_time = time.time()
-                self.insert_to_database(records)
-                insert_time = time.time() - start_time
-                self.log(f"  ✓ Inserted {len(records)} records in {insert_time:.1f}s")
-            
-            # Cleanup GRIB IMMEDIATELY
+            # Delete GRIB immediately
             grib_path.unlink()
             
-            # Force garbage collection
-            record_count = len(records)
-            del records
+            # Force GC
             gc.collect()
             
             return record_count
             
         except Exception as e:
             self.log(f"  ✗ Failed f{fhr_str}: {str(e)}")
-            # Cleanup on error
             if grib_path.exists():
                 grib_path.unlink()
             return 0
 
     def run(self):
-        """Main ingestion process with intelligent update strategy"""
+        """Main ingestion process"""
         try:
             # Get latest cycle
             cycle = self.get_latest_nbm_cycle()
@@ -512,9 +538,9 @@ class SmartNBMIngester:
             forecast_hours = forecast_plan['hours']
             
             self.log(f"Strategy: {forecast_plan['reason']}")
-            self.log(f"Will process {len(forecast_hours)} forecast hours: {forecast_hours}")
+            self.log(f"Will process {len(forecast_hours)} hours: {forecast_hours}")
             
-            # Load ZIP codes ONCE
+            # Load ZIP codes
             zips = self.load_zip_codes()
             
             # Process each forecast hour
@@ -528,9 +554,8 @@ class SmartNBMIngester:
                     zips
                 )
                 total_records += record_count
-                self.log(f"Total records inserted: {total_records}")
+                self.log(f"TOTAL: {total_records} records inserted so far")
                 
-                # Force garbage collection between hours
                 gc.collect()
             
             # Log this run
@@ -541,7 +566,7 @@ class SmartNBMIngester:
                 total_records
             )
             
-            self.log(f"✓ Ingestion completed - {total_records} total records")
+            self.log(f"✓ Ingestion completed - {total_records} records")
             return 0
             
         except Exception as e:
@@ -552,6 +577,6 @@ class SmartNBMIngester:
 
 
 if __name__ == '__main__':
-    ingester = SmartNBMIngester()
+    ingester = StreamingNBMIngester()
     exit_code = ingester.run()
     sys.exit(exit_code)
