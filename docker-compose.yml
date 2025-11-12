@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   nbm-ingester:
     build: .
@@ -27,20 +25,15 @@ services:
     restart: "no"  # Run once and exit
     
     # Resource limits (adjust based on your system)
-    deploy:
-      resources:
-        limits:
-          cpus: '4'
-          memory: 4G
-        reservations:
-          cpus: '2'
-          memory: 2G
     
     # Network (if your DB is in another container)
-    # networks:
-    #   - wxalerts-network
+    networks:
+      - frontend
+      - backend
 
-# Optional: if using docker network
-# networks:
-#   wxalerts-network:
-#     external: true
+networks:
+  frontend:
+    name: frontend
+  backend:
+    internal: true
+    driver: bridge
