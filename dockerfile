@@ -24,9 +24,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Python deps
 RUN pip3 install --no-cache-dir \
-    numpy pandas scipy psycopg2-binary redis python-dotenv
+    numpy \
+    pandas \
+    scipy \
+    psycopg2-binary \
+    redis \
+    python-dotenv\
+    rasterio \
+    matplotlib \
+    cartopy \
+    pygrib \
+    boto3
 
-# App
 WORKDIR /app
 COPY ingest_nbm.py /app/
 COPY wgrib2 /app/

@@ -3,6 +3,8 @@ services:
     build: .
     image: ghcr.io/chancellor1101/nbm-ingester
     container_name: nbm-ingester
+    env_file:
+      - .env
     
     environment:
       # Database connection
